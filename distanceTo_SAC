@@ -1,0 +1,633 @@
+rm(list = ls())
+
+library("lubridate")
+
+library("ncdf4")
+library("reshape2")
+library('sf')
+library("raster")
+library('fasterize')
+library("ggspatial")
+
+library("ggplot2")
+library("viridis")
+library("grid")
+library("gridExtra")
+
+library("tidyverse")
+
+setwd("workingDirectory")
+Sys.setenv(TZ='UTC')
+
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+## coastline and EEZ 
+
+##%%%%%%%%%%%%
+## coastline
+coastLine_df <- readRDS("./dataRef/europeCoast.rds")[[2]]
+coastLine_pg <- readRDS("./dataRef/europeCoast.rds")[[1]]
+
+##%%%%%%%%%%%%
+## EEZ
+irelandEEZ_pg <- st_read('./dataRef/irelandEEZ/eez.shp')
+irelandEEZ_df <- st_coordinates(irelandEEZ_pg)
+irelandEEZ_df <- as.data.frame(irelandEEZ_df)
+summary(irelandEEZ_df)
+
+irelandEEZ_df <- irelandEEZ_df[c(98299:nrow(irelandEEZ_df), 1:891), ]
+
+##%%%%%%%%%%%%
+## SAC
+sacs_coast <- st_read('./dataRef/SAC_ITM_2026_01/SAC_ITM_2026_01.shp')
+sacs_coast <- st_transform(sacs_coast, "+proj=longlat +ellps=WGS84 +datum=WGS84")
+sacs_coast <- sacs_coast %>% dplyr::select("SITECODE", "SITE_NAME", "Source_CRS", "geometry")
+
+sacs_offshore <- st_read('./dataRef/SAC_ITM_2026_01/SAC_Offshore_WGS84_2022_11.shp')
+sacs_offshore <- st_transform(sacs_offshore, "+proj=longlat +ellps=WGS84 +datum=WGS84")
+sacs_offshore <- sacs_offshore %>% dplyr::select("SITECODE", "SITE_NAME", "Source_CRS", "geometry")
+
+sacs <- do.call(rbind, list(sacs_coast, sacs_offshore))
+  
+##%%%%%%%%%%%%
+## ow - offshore wind
+ow <- st_read('../workingDirectory/OW_RelevantSites_IRL/OW_RelevantSites_IRL.shp')
+
+##%%%%%%%%%%%%
+## cable/pipelines
+cablePipeline <- st_read('./dataRef/Cable_Pipeline_Infrastructure/Cable_Pipeline_Infrastructure.shp')
+
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+## limits for gridding and plotting etc
+
+## whole EEZ
+mapLimitsX <- c(-16.2, -2.8)
+mapLimitsY <- c(48, 57)
+
+## zoomed in
+mapLimitsX_zoom <- c(-12.8, -5.2)
+mapLimitsY_zoom <- c(50.8, 55.8)
+
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+## select out relevant SACs and coordinates
+
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+## create list of SAC codes and species
+
+## bnDolphin
+siteCodes <- data.frame(sitecodes = c("000191", "000328", "000495", "000764", "002074", "002165", "002327", "002329", "002998", "003001") )
+siteCodes$species <- rep('bnDolphin', nrow(siteCodes))
+
+## add harbour porpoise
+dataTemp <- data.frame(sitecodes = c("000101", "000204", "000213", "000625", "000764", "001141", "002111", "002158", "002172", "002269",
+                                     "002287", "002327", "002953", "002998", "003000", "003015"))
+dataTemp$species <- rep('harbourPorpoise', nrow(dataTemp))
+
+siteCodes <- rbind(siteCodes, dataTemp)
+rm(dataTemp)
+
+## add grey seals
+dataTemp <- data.frame(sitecodes = c("000101", "000147", "000190", "000204", "000278", "000328", "000495", "000507", "000707", "002172"))
+dataTemp$species <- rep('greySeal', nrow(dataTemp))
+
+siteCodes <- rbind(siteCodes, dataTemp)
+rm(dataTemp)
+
+## add harbour seals
+dataTemp <- data.frame(sitecodes = c("000090", "000133", "000197", "000204", "000268", "000458", "000622", "000627", "000781", "001482",
+                                     "002111", "002158", "002283"))
+dataTemp$species <- rep('harbourSeal', nrow(dataTemp))
+
+siteCodes <- rbind(siteCodes, dataTemp)
+rm(dataTemp)
+
+## add otters
+dataTemp <- data.frame(sitecodes = c("000007", "000032", "000057", "000090", "000101", "000108", "000190", "000197", "000216", "000268",
+                                     "000297", "000343", "000365", "000428", "000440", "000470", "000534", "000623", "000781", "001141",
+                                     "001482", "001774", "001898", "001926", "001932", "001976", "002012", "002031", "002034", "002047",
+                                     "002070", "002111", "002122", "002137", "002158", "002159", "002162", "002165", "002170", "002173",
+                                     "002176", "002287", "002298", "002299", "002301"))
+dataTemp$species <- rep('otter', nrow(dataTemp))
+
+siteCodes <- rbind(siteCodes, dataTemp)
+rm(dataTemp)
+
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+## create map of distance to SAC - all
+
+## create base grid
+baseGrid <- raster(xmn = min(mapLimitsX),
+                   xmx = max(mapLimitsX),
+                   ymn = min(mapLimitsY),
+                   ymx = max(mapLimitsY),
+                   crs = "+proj=longlat +datum=WGS84 +ellps=WGS84")
+baseGrid <- projectRaster(baseGrid, crs = "+proj=utm +zone=29 +datum=WGS84 +units=m +no_defs")
+res(baseGrid) <- 500
+baseGrid <- projectRaster(baseGrid, crs = "+proj=longlat +datum=WGS84 +ellps=WGS84")
+values(baseGrid) <- 0
+
+## mark points that are within an SAC (with 4)
+cell_ID <- NA
+siteCodesRef <- siteCodes
+
+for(II in 1:nrow(siteCodesRef)){
+  dataTemp <- sacs %>% dplyr::filter(SITECODE == siteCodesRef$sitecodes[II])
+  dataTemp <- as_Spatial(dataTemp$geom)
+
+  cell_ID <- c(cell_ID, unname(raster::extract(baseGrid, dataTemp, cellnumbers = TRUE)[[1]][, 1]))
+  
+  rm(dataTemp)
+}
+rm(II)
+
+cell_ID <- cell_ID[-1]
+baseGrid[cell_ID] <- 4
+
+# plot(baseGrid)
+
+## identify points outwith within EEZ (overriding SAC allocations if they are on land)
+baseGrid <- raster::mask(baseGrid, irelandEEZ_pg, inverse = FALSE) ## if you get an error about extents try restarting R.
+baseGrid@data@values[is.na(baseGrid@data@values) == 1] <- 2
+# plot(baseGrid)
+
+## calculate distances to SAC's
+distance_sac <- gridDistance(baseGrid, origin = 4, omit = 2)/1000
+distance_sac <- as.data.frame(distance_sac, xy = TRUE)
+distance_sac <- distance_sac[which(is.na(distance_sac$layer) == 0), ]
+
+## plot out
+plotOut <- ggplot(distance_sac, aes(x, y, fill = layer)) +
+  geom_polygon(data = coastLine_df, aes(x = long, y = lat, group = group), color = 'grey42', fill = "grey84") +
+  geom_tile() +
+
+  xlab("longitude") +
+  ylab("latitude") +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  
+  scale_fill_viridis(name = "distance (km)", direction = 1, option = "D", discrete = FALSE,
+                     trans = "pseudo_log",
+                     guide = guide_colourbar(title.position = "top", barwidth = 1, barheight = 14),
+                     breaks = c(0, 1, 5, 10, 50, 100, 200, 400)) +
+  
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        legend.text = element_text(size = 10),
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_rect(colour = "grey42", fill = NA, linewidth = 1)) +
+  
+  coord_sf(xlim = mapLimitsX, ylim = mapLimitsY, crs = 4326) +
+  annotation_scale(location = "br", width_hint = 0.5, unit_category = "metric") +
+  ggtitle('')
+
+# ggsave(paste0("./distanceSAC_all_eez", ".png"), plotOut, width = 22, height = 22, units = "cm", dpi = 150)
+# ggsave(paste0("./distanceSAC_all_zoom", ".png"), plotOut + coord_sf(xlim = mapLimitsX_zoom, ylim = mapLimitsY_zoom, crs = 4326), width = 22, height = 22, units = "cm", dpi = 300)
+
+png(filename = paste("./distanceSAC_all_eez.png", sep = ""), width = 28, height = 16, res = 300, units = "cm")
+plotLayout = rbind(c(1, 1, 1, 1, 2, 2, 2, 2, 2))
+grid.arrange(plotOut + theme(plot.title = element_text(size = 12),
+                             legend.position = 'none') + 
+               ggtitle("(a) Distance to SAC across the Irish EEZ"),
+             plotOut + theme(plot.title = element_text(size = 12)) +
+               coord_sf(xlim = mapLimitsX_zoom, ylim = mapLimitsY_zoom, crs = 4326) + ylab('') + 
+               ggtitle("(b) Distances focused on nearer-shore waters"),
+             ncol = 2, layout_matrix = plotLayout)
+dev.off()
+
+rm(plotOut, distance_sac, siteCodesRef, cell_ID, baseGrid)
+
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+## create map of distance to SAC - bottlenose dolphin
+
+## create base grid
+baseGrid <- raster(xmn = min(mapLimitsX),
+                   xmx = max(mapLimitsX),
+                   ymn = min(mapLimitsY),
+                   ymx = max(mapLimitsY),
+                   crs = "+proj=longlat +datum=WGS84 +ellps=WGS84")
+baseGrid <- projectRaster(baseGrid, crs = "+proj=utm +zone=29 +datum=WGS84 +units=m +no_defs")
+res(baseGrid) <- 500
+baseGrid <- projectRaster(baseGrid, crs = "+proj=longlat +datum=WGS84 +ellps=WGS84")
+values(baseGrid) <- 0
+
+## mark points that are within an SAC (with 4)
+cell_ID <- NA
+siteCodesRef <- siteCodes[which(siteCodes$species == 'bnDolphin'), ]
+
+for(II in 1:nrow(siteCodesRef)){
+  dataTemp <- sacs %>% dplyr::filter(SITECODE == siteCodesRef$sitecodes[II])
+  dataTemp <- as_Spatial(dataTemp$geom)
+  
+  cell_ID <- c(cell_ID, unname(raster::extract(baseGrid, dataTemp, cellnumbers = TRUE)[[1]][, 1]))
+  
+  rm(dataTemp)
+}
+rm(II)
+
+cell_ID <- cell_ID[-1]
+baseGrid[cell_ID] <- 4
+
+# plot(baseGrid)
+
+## identify points outwith within EEZ (overriding SAC allocations if they are on land)
+baseGrid <- raster::mask(baseGrid, irelandEEZ_pg, inverse = FALSE) ## if you get an error about extents try restarting R.
+baseGrid@data@values[is.na(baseGrid@data@values) == 1] <- 2
+# # plot(baseGrid)
+
+## calculate distances to SAC's
+distance_sac <- gridDistance(baseGrid, origin = 4, omit = 2)/1000
+distance_sac <- as.data.frame(distance_sac, xy = TRUE)
+distance_sac <- distance_sac[which(is.na(distance_sac$layer) == 0), ]
+
+## plot out
+plotOut <- ggplot(distance_sac, aes(x, y, fill = layer)) +
+  geom_polygon(data = coastLine_df, aes(x = long, y = lat, group = group), color = 'grey42', fill = "grey84") +
+  geom_tile() +
+  
+  xlab("longitude") +
+  ylab("latitude") +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  
+  scale_fill_viridis(name = "distance (km)", direction = 1, option = "D", discrete = FALSE,
+                     trans = "pseudo_log",
+                     guide = guide_colourbar(title.position = "top", barwidth = 1, barheight = 14),
+                     breaks = c(0, 1, 5, 10, 50, 100, 200, 400)) +
+  
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        legend.text = element_text(size = 10),
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_rect(colour = "grey42", fill = NA, size = 1)) +
+  
+  coord_sf(xlim = mapLimitsX, ylim = mapLimitsY, crs = 4326) +
+  annotation_scale(location = "br", width_hint = 0.5, unit_category = "metric") +
+  ggtitle('')
+
+# ggsave(paste0("./distanceSAC_bnDolphin_eez", ".png"), plotOut, width = 22, height = 22, units = "cm", dpi = 150)
+# ggsave(paste0("./distanceSAC_bnDolphin_zoom", ".png"), plotOut + coord_sf(xlim = mapLimitsX_zoom, ylim = mapLimitsY_zoom, crs = 4326), width = 22, height = 22, units = "cm", dpi = 300)
+
+png(filename = paste("./distanceSAC_bnDolphin_eez.png", sep = ""), width = 28, height = 16, res = 300, units = "cm")
+plotLayout = rbind(c(1, 1, 1, 1, 2, 2, 2, 2, 2))
+grid.arrange(plotOut + theme(plot.title = element_text(size = 12),
+                             legend.position = 'none') + 
+               ggtitle("(a) Distance to SAC (bottlenose dolphin)"),
+             plotOut + theme(plot.title = element_text(size = 12)) +
+               coord_sf(xlim = mapLimitsX_zoom, ylim = mapLimitsY_zoom, crs = 4326) + ylab('') + 
+               ggtitle("(b) Distances focused on nearer-shore waters"),
+             ncol = 2, layout_matrix = plotLayout)
+dev.off()
+
+rm(plotOut, distance_sac, siteCodesRef, cell_ID, baseGrid)
+
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+## create map of distance to SAC - harbour porpoise
+
+## create base grid
+baseGrid <- raster(xmn = min(mapLimitsX),
+                   xmx = max(mapLimitsX),
+                   ymn = min(mapLimitsY),
+                   ymx = max(mapLimitsY),
+                   crs = "+proj=longlat +datum=WGS84 +ellps=WGS84")
+baseGrid <- projectRaster(baseGrid, crs = "+proj=utm +zone=29 +datum=WGS84 +units=m +no_defs")
+res(baseGrid) <- 500
+baseGrid <- projectRaster(baseGrid, crs = "+proj=longlat +datum=WGS84 +ellps=WGS84")
+values(baseGrid) <- 0
+
+## mark points that are within an SAC (with 4)
+cell_ID <- NA
+siteCodesRef <- siteCodes[which(siteCodes$species == 'harbourPorpoise'), ]
+
+for(II in 1:nrow(siteCodesRef)){
+  dataTemp <- sacs %>% dplyr::filter(SITECODE == siteCodesRef$sitecodes[II])
+  dataTemp <- as_Spatial(dataTemp$geom)
+  
+  cell_ID <- c(cell_ID, unname(raster::extract(baseGrid, dataTemp, cellnumbers = TRUE)[[1]][, 1]))
+  
+  rm(dataTemp)
+}
+rm(II)
+
+cell_ID <- cell_ID[-1]
+baseGrid[cell_ID] <- 4
+
+# plot(baseGrid)
+
+## identify points outwith within EEZ (overriding SAC allocations if they are on land)
+baseGrid <- raster::mask(baseGrid, irelandEEZ_pg, inverse = FALSE) ## if you get an error about extents try restarting R.
+baseGrid@data@values[is.na(baseGrid@data@values) == 1] <- 2
+# plot(baseGrid)
+
+## calculate distances to SAC's
+distance_sac <- gridDistance(baseGrid, origin = 4, omit = 2)/1000
+distance_sac <- as.data.frame(distance_sac, xy = TRUE)
+distance_sac <- distance_sac[which(is.na(distance_sac$layer) == 0), ]
+
+## plot out
+plotOut <- ggplot(distance_sac, aes(x, y, fill = layer)) +
+  geom_polygon(data = coastLine_df, aes(x = long, y = lat, group = group), color = 'grey42', fill = "grey84") +
+  geom_tile() +
+  
+  xlab("longitude") +
+  ylab("latitude") +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  
+  scale_fill_viridis(name = "distance (km)", direction = 1, option = "D", discrete = FALSE,
+                     trans = "pseudo_log",
+                     guide = guide_colourbar(title.position = "top", barwidth = 1, barheight = 14),
+                     breaks = c(0, 1, 5, 10, 50, 100, 200, 400)) +
+  
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        legend.text = element_text(size = 10),
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_rect(colour = "grey42", fill = NA, size = 1)) +
+  
+  coord_sf(xlim = mapLimitsX, ylim = mapLimitsY, crs = 4326) +
+  annotation_scale(location = "br", width_hint = 0.5, unit_category = "metric") +
+  ggtitle('')
+
+# ggsave(paste0("./distanceSAC_harbourPorpoise_eez", ".png"), plotOut, width = 22, height = 22, units = "cm", dpi = 150)
+# ggsave(paste0("./distanceSAC_harbourPorpoise_zoom", ".png"), plotOut + coord_sf(xlim = mapLimitsX_zoom, ylim = mapLimitsY_zoom, crs = 4326), width = 22, height = 22, units = "cm", dpi = 300)
+
+png(filename = paste("./distanceSAC_harbourPorpoise_eez.png", sep = ""), width = 28, height = 16, res = 300, units = "cm")
+plotLayout = rbind(c(1, 1, 1, 1, 2, 2, 2, 2, 2))
+grid.arrange(plotOut + theme(plot.title = element_text(size = 12),
+                             legend.position = 'none') + 
+               ggtitle("(a) Distance to SAC (harbour porpoise)"),
+             plotOut + theme(plot.title = element_text(size = 12)) +
+               coord_sf(xlim = mapLimitsX_zoom, ylim = mapLimitsY_zoom, crs = 4326) + ylab('') + 
+               ggtitle("(b) Distances focused on nearer-shore waters"),
+             ncol = 2, layout_matrix = plotLayout)
+dev.off()
+
+rm(plotOut, distance_sac, siteCodesRef, cell_ID, baseGrid)
+
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+## create map of distance to SAC - grey seal
+
+## create base grid
+baseGrid <- raster(xmn = min(mapLimitsX),
+                   xmx = max(mapLimitsX),
+                   ymn = min(mapLimitsY),
+                   ymx = max(mapLimitsY),
+                   crs = "+proj=longlat +datum=WGS84 +ellps=WGS84")
+baseGrid <- projectRaster(baseGrid, crs = "+proj=utm +zone=29 +datum=WGS84 +units=m +no_defs")
+res(baseGrid) <- 500
+baseGrid <- projectRaster(baseGrid, crs = "+proj=longlat +datum=WGS84 +ellps=WGS84")
+values(baseGrid) <- 0
+
+## mark points that are within an SAC (with 4)
+cell_ID <- NA
+siteCodesRef <- siteCodes[which(siteCodes$species == 'greySeal'), ]
+
+for(II in 1:nrow(siteCodesRef)){
+  dataTemp <- sacs %>% dplyr::filter(SITECODE == siteCodesRef$sitecodes[II])
+  dataTemp <- as_Spatial(dataTemp$geom)
+  
+  cell_ID <- c(cell_ID, unname(raster::extract(baseGrid, dataTemp, cellnumbers = TRUE)[[1]][, 1]))
+  
+  rm(dataTemp)
+}
+rm(II)
+
+cell_ID <- cell_ID[-1]
+baseGrid[cell_ID] <- 4
+
+# plot(baseGrid)
+
+## identify points outwith within EEZ (overriding SAC allocations if they are on land)
+baseGrid <- raster::mask(baseGrid, irelandEEZ_pg, inverse = FALSE) ## if you get an error about extents try restarting R.
+baseGrid@data@values[is.na(baseGrid@data@values) == 1] <- 2
+# plot(baseGrid)
+
+## calculate distances to SAC's
+distance_sac <- gridDistance(baseGrid, origin = 4, omit = 2)/1000
+distance_sac <- as.data.frame(distance_sac, xy = TRUE)
+distance_sac <- distance_sac[which(is.na(distance_sac$layer) == 0), ]
+
+## plot out
+plotOut <- ggplot(distance_sac, aes(x, y, fill = layer)) +
+  geom_polygon(data = coastLine_df, aes(x = long, y = lat, group = group), color = 'grey42', fill = "grey84") +
+  geom_tile() +
+  
+  xlab("longitude") +
+  ylab("latitude") +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  
+  scale_fill_viridis(name = "distance (km)", direction = 1, option = "D", discrete = FALSE,
+                     trans = "pseudo_log",
+                     guide = guide_colourbar(title.position = "top", barwidth = 1, barheight = 14),
+                     breaks = c(0, 1, 5, 10, 50, 100, 200, 400)) +
+  
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        legend.text = element_text(size = 10),
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_rect(colour = "grey42", fill = NA, size = 1)) +
+  
+  coord_sf(xlim = mapLimitsX, ylim = mapLimitsY, crs = 4326) +
+  annotation_scale(location = "br", width_hint = 0.5, unit_category = "metric") +
+  ggtitle('')
+
+# ggsave(paste0("./distanceSAC_greySeal_eez", ".png"), plotOut, width = 22, height = 22, units = "cm", dpi = 300)
+# ggsave(paste0("./distanceSAC_greySeal_zoom", ".png"), plotOut + coord_sf(xlim = mapLimitsX_zoom, ylim = mapLimitsY_zoom, crs = 4326), width = 22, height = 22, units = "cm", dpi = 300)
+
+png(filename = paste("./distanceSAC_greySeal_eez.png", sep = ""), width = 28, height = 16, res = 300, units = "cm")
+plotLayout = rbind(c(1, 1, 1, 1, 2, 2, 2, 2, 2))
+grid.arrange(plotOut + theme(plot.title = element_text(size = 12),
+                             legend.position = 'none') + 
+               ggtitle("(a) Distance to SAC (grey seal)"),
+             plotOut + theme(plot.title = element_text(size = 12)) +
+               coord_sf(xlim = mapLimitsX_zoom, ylim = mapLimitsY_zoom, crs = 4326) + ylab('') + 
+               ggtitle("(b) Distances focused on nearer-shore waters"),
+             ncol = 2, layout_matrix = plotLayout)
+dev.off()
+
+rm(plotOut, distance_sac, siteCodesRef, cell_ID, baseGrid)
+
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+## create map of distance to SAC - harbour seal
+
+## create base grid
+baseGrid <- raster(xmn = min(mapLimitsX),
+                   xmx = max(mapLimitsX),
+                   ymn = min(mapLimitsY),
+                   ymx = max(mapLimitsY),
+                   crs = "+proj=longlat +datum=WGS84 +ellps=WGS84")
+baseGrid <- projectRaster(baseGrid, crs = "+proj=utm +zone=29 +datum=WGS84 +units=m +no_defs")
+res(baseGrid) <- 500
+baseGrid <- projectRaster(baseGrid, crs = "+proj=longlat +datum=WGS84 +ellps=WGS84")
+values(baseGrid) <- 0
+
+## mark points that are within an SAC (with 4)
+cell_ID <- NA
+siteCodesRef <- siteCodes[which(siteCodes$species == 'harbourSeal'), ]
+
+for(II in 1:nrow(siteCodesRef)){
+  dataTemp <- sacs %>% dplyr::filter(SITECODE == siteCodesRef$sitecodes[II])
+  dataTemp <- as_Spatial(dataTemp$geom)
+  
+  cell_ID <- c(cell_ID, unname(raster::extract(baseGrid, dataTemp, cellnumbers = TRUE)[[1]][, 1]))
+  
+  rm(dataTemp)
+}
+rm(II)
+
+cell_ID <- cell_ID[-1]
+baseGrid[cell_ID] <- 4
+
+# plot(baseGrid)
+
+## identify points outwith within EEZ (overriding SAC allocations if they are on land)
+baseGrid <- raster::mask(baseGrid, irelandEEZ_pg, inverse = FALSE) ## if you get an error about extents try restarting R.
+baseGrid@data@values[is.na(baseGrid@data@values) == 1] <- 2
+# plot(baseGrid)
+
+## calculate distances to SAC's
+distance_sac <- gridDistance(baseGrid, origin = 4, omit = 2)/1000
+distance_sac <- as.data.frame(distance_sac, xy = TRUE)
+distance_sac <- distance_sac[which(is.na(distance_sac$layer) == 0), ]
+
+## plot out
+plotOut <- ggplot(distance_sac, aes(x, y, fill = layer)) +
+  geom_polygon(data = coastLine_df, aes(x = long, y = lat, group = group), color = 'grey42', fill = "grey84") +
+  geom_tile() +
+  
+  xlab("longitude") +
+  ylab("latitude") +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  
+  scale_fill_viridis(name = "distance (km)", direction = 1, option = "D", discrete = FALSE,
+                     trans = "pseudo_log",
+                     guide = guide_colourbar(title.position = "top", barwidth = 1, barheight = 14),
+                     breaks = c(0, 1, 5, 10, 50, 100, 200, 400)) +
+  
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        legend.text = element_text(size = 10),
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_rect(colour = "grey42", fill = NA, size = 1)) +
+  
+  coord_sf(xlim = mapLimitsX, ylim = mapLimitsY, crs = 4326) +
+  annotation_scale(location = "br", width_hint = 0.5, unit_category = "metric") +
+  ggtitle('')
+
+# ggsave(paste0("./distanceSAC_harbourSeal_eez", ".png"), plotOut, width = 22, height = 22, units = "cm", dpi = 300)
+# ggsave(paste0("./distanceSAC_harbourSeal_zoom", ".png"), plotOut + coord_sf(xlim = mapLimitsX_zoom, ylim = mapLimitsY_zoom, crs = 4326), width = 22, height = 22, units = "cm", dpi = 300)
+
+png(filename = paste("./distanceSAC_harbourSeal_eez.png", sep = ""), width = 28, height = 16, res = 300, units = "cm")
+plotLayout = rbind(c(1, 1, 1, 1, 2, 2, 2, 2, 2))
+grid.arrange(plotOut + theme(plot.title = element_text(size = 12),
+                             legend.position = 'none') + 
+               ggtitle("(a) Distance to SAC (harbour seal)"),
+             plotOut + theme(plot.title = element_text(size = 12)) +
+               coord_sf(xlim = mapLimitsX_zoom, ylim = mapLimitsY_zoom, crs = 4326) + ylab('') + 
+               ggtitle("(b) Distances focused on nearer-shore waters"),
+             ncol = 2, layout_matrix = plotLayout)
+dev.off()
+
+rm(plotOut, distance_sac, siteCodesRef, cell_ID, baseGrid)
+
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+## create map of distance to SAC - otter
+
+## create base grid
+baseGrid <- raster(xmn = min(mapLimitsX),
+                   xmx = max(mapLimitsX),
+                   ymn = min(mapLimitsY),
+                   ymx = max(mapLimitsY),
+                   crs = "+proj=longlat +datum=WGS84 +ellps=WGS84")
+baseGrid <- projectRaster(baseGrid, crs = "+proj=utm +zone=29 +datum=WGS84 +units=m +no_defs")
+res(baseGrid) <- 500
+baseGrid <- projectRaster(baseGrid, crs = "+proj=longlat +datum=WGS84 +ellps=WGS84")
+values(baseGrid) <- 0
+
+## mark points that are within an SAC (with 4)
+cell_ID <- NA
+siteCodesRef <- siteCodes[which(siteCodes$species == 'otter'), ]
+
+for(II in 1:nrow(siteCodesRef)){
+  dataTemp <- sacs %>% dplyr::filter(SITECODE == siteCodesRef$sitecodes[II])
+  dataTemp <- as_Spatial(dataTemp$geom)
+  
+  cell_ID <- c(cell_ID, unname(raster::extract(baseGrid, dataTemp, cellnumbers = TRUE)[[1]][, 1]))
+  
+  rm(dataTemp)
+}
+rm(II)
+
+cell_ID <- cell_ID[-1]
+baseGrid[cell_ID] <- 4
+
+# plot(baseGrid)
+
+## identify points outwith within EEZ (overriding SAC allocations if they are on land)
+baseGrid <- raster::mask(baseGrid, irelandEEZ_pg, inverse = FALSE) ## if you get an error about extents try restarting R.
+baseGrid@data@values[is.na(baseGrid@data@values) == 1] <- 2
+# plot(baseGrid)
+
+## calculate distances to SAC's
+distance_sac <- gridDistance(baseGrid, origin = 4, omit = 2)/1000
+distance_sac <- as.data.frame(distance_sac, xy = TRUE)
+distance_sac <- distance_sac[which(is.na(distance_sac$layer) == 0), ]
+
+## plot out
+plotOut <- ggplot(distance_sac, aes(x, y, fill = layer)) +
+  geom_polygon(data = coastLine_df, aes(x = long, y = lat, group = group), color = 'grey42', fill = "grey84") +
+  geom_tile() +
+  
+  xlab("longitude") +
+  ylab("latitude") +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  
+  scale_fill_viridis(name = "distance (km)", direction = 1, option = "D", discrete = FALSE,
+                     trans = "pseudo_log",
+                     guide = guide_colourbar(title.position = "top", barwidth = 1, barheight = 14),
+                     breaks = c(0, 1, 5, 10, 50, 100, 200, 400)) +
+  
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        legend.text = element_text(size = 10),
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_rect(colour = "grey42", fill = NA, size = 1)) +
+  
+  coord_sf(xlim = mapLimitsX, ylim = mapLimitsY, crs = 4326) +
+  annotation_scale(location = "br", width_hint = 0.5, unit_category = "metric") +
+  ggtitle('')
+
+# ggsave(paste0("./distanceSAC_otter_eez", ".png"), plotOut, width = 22, height = 22, units = "cm", dpi = 300)
+# ggsave(paste0("./distanceSAC_otter_zoom", ".png"), plotOut + coord_sf(xlim = mapLimitsX_zoom, ylim = mapLimitsY_zoom, crs = 4326), width = 22, height = 22, units = "cm", dpi = 300)
+
+png(filename = paste("./distanceSAC_otter__eez.png", sep = ""), width = 28, height = 16, res = 300, units = "cm")
+plotLayout = rbind(c(1, 1, 1, 1, 2, 2, 2, 2, 2))
+grid.arrange(plotOut + theme(plot.title = element_text(size = 12),
+                             legend.position = 'none') + 
+               ggtitle("(a) Distance to SAC (otter)"),
+             plotOut + theme(plot.title = element_text(size = 12)) +
+               coord_sf(xlim = mapLimitsX_zoom, ylim = mapLimitsY_zoom, crs = 4326) + ylab('') + 
+               ggtitle("(b) Distances focused on nearer-shore waters"),
+             ncol = 2, layout_matrix = plotLayout)
+dev.off()
+
+rm(plotOut, distance_sac, siteCodesRef, cell_ID, baseGrid)
+
+
